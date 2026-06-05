@@ -53,6 +53,10 @@ pub struct Config {
     /// Maximum number of concurrent in-flight export requests.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
+
+    /// If true, emit info logs with payload size when sending export requests.
+    #[serde(default)]
+    pub log_payload_size: bool,
 }
 
 fn default_max_response_body_length() -> usize {

@@ -1,0 +1,72 @@
+version: otel_dataflow/v1
+engine: { }
+groups:
+  default:
+    pipelines:
+      main:
+        # OTLP receiver (gRPC + HTTP) -> filter(service.name=amcs) -> batch(1MiB) -> OTLP HTTP exporter
+
+        policies:
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  max_decoding_message_size: "64MiB"
+                http:
+                  listening_addr: "127.0.0.1:4318"
+                  max_request_body_size: "64MiB"
+
+          filter:
+            type: processor:filter
+            config:
+              log_dropped_messages: true
+              logs:
+                include:
+                  match_type: strict
+                  resource_attributes:
+                    - key: service.name
+                      value: amcs
+              traces:
+                include:
+                  match_type: strict
+                  resource_attributes:
+                    - key: service.name
+                      value: amcs
+                  span_names: []
+
+          batch:
+            type: processor:batch
+            config:
+              otlp:
+                sizer: bytes
+                min_size: 1048576
+                max_size: 1048576
+              max_batch_duration: 2000ms
+              format: otlp
+
+          exporter:
+            type: exporter:otlp_http
+            config:
+              http: {}
+              endpoint: "http://127.0.0.1:4320"
+              logs_endpoint: "http://127.0.0.1:4320/v1/logs"
+              traces_endpoint: "http://127.0.0.1:4320/v1/traces"
+              client_pool_size: 1
+              log_payload_size: true
+
+        connections:
+          - from: receiver
+            to: filter
+          - from: filter
+            to: batch
+          - from: batch
+            to: exporter

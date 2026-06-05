@@ -81,10 +81,15 @@ impl TraceFilter {
     }
 
     /// take a traces payload and return the filtered result
+    /// returns tuple of `(filtered batch, spans_consumed, spans_filtered,
+    /// spans_dropped_by_resource_attr_mismatch)`. The fourth element counts
+    /// spans removed specifically because their resource row did not match
+    /// the configured `resource_attributes` rules; it is `0` when no
+    /// resource-attribute rule is configured.
     pub fn filter(
         &self,
         mut traces_payload: OtapArrowRecords,
-    ) -> Result<(OtapArrowRecords, u64, u64)> {
+    ) -> Result<(OtapArrowRecords, u64, u64, u64)> {
         let (
             resource_attr_filter,
             span_filter,
@@ -163,7 +168,27 @@ impl TraceFilter {
                     payload_type: ArrowPayloadType::Spans,
                 })?
                 .num_rows() as u64;
-            return Ok((traces_payload, num_rows, num_rows));
+            return Ok((traces_payload, num_rows, num_rows, 0));
+        };
+
+        // Capture, before any record/attribute filters narrow the surviving
+        // row set, how many spans would be eliminated purely because their
+        // resource row failed the resource_attributes rules.
+        let resource_attr_dropped = {
+            let spans = traces_payload
+                .get(ArrowPayloadType::Spans)
+                .ok_or_else(|| Error::SpanRecordNotFound {})?;
+            let span_resource_ids_column = get_required_array_from_struct_array_from_record_batch(
+                spans,
+                consts::RESOURCE,
+                consts::ID,
+            )?;
+            crate::otap::filter::count_resource_attr_only_drops(
+                spans.num_rows(),
+                traces_payload.get(ArrowPayloadType::ResourceAttrs),
+                Some(span_resource_ids_column),
+                &resource_attr_filter,
+            )?
         };
 
         let (span_filter, child_record_batch_filters) = self.sync_up_filters(
@@ -183,7 +208,12 @@ impl TraceFilter {
             let (_, _) = apply_filter(&mut traces_payload, payload_type, &filter)?;
         }
 
-        Ok((traces_payload, span_rows_before, span_rows_removed))
+        Ok((
+            traces_payload,
+            span_rows_before,
+            span_rows_removed,
+            resource_attr_dropped,
+        ))
     }
 
     /// this function takes the filters for each record batch and makes sure that incomplete
@@ -711,7 +741,12 @@ impl TraceMatchProperties {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::otap::filter::AnyValue as FilterAnyValue;
     use crate::proto::OtlpProtoMessage;
+    use crate::proto::opentelemetry::common::v1::{
+        AnyValue as ProtoAnyValue, KeyValue as ProtoKeyValue,
+    };
+    use crate::proto::opentelemetry::resource::v1::Resource;
     use crate::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
     use crate::testing::equiv::assert_equivalent;
     use crate::testing::round_trip::{otap_to_otlp, otlp_to_otap};
@@ -748,10 +783,12 @@ mod test {
         };
 
         let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
-        let (result, spans_consumed, spans_filtered) = filter.filter(input).unwrap();
+        let (result, spans_consumed, spans_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
 
         assert_eq!(spans_consumed, 4);
         assert_eq!(spans_filtered, 2);
+        assert_eq!(resource_attr_dropped, 0);
 
         let expected = otlp_to_otap(&OtlpProtoMessage::Traces(TracesData {
             resource_spans: vec![ResourceSpans {
@@ -798,10 +835,12 @@ mod test {
         };
 
         let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
-        let (result, spans_consumed, spans_filtered) = filter.filter(input).unwrap();
+        let (result, spans_consumed, spans_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
 
         assert_eq!(spans_consumed, 4);
         assert_eq!(spans_filtered, 2);
+        assert_eq!(resource_attr_dropped, 0);
 
         let expected = otlp_to_otap(&OtlpProtoMessage::Traces(TracesData {
             resource_spans: vec![ResourceSpans {
@@ -814,5 +853,291 @@ mod test {
         }));
 
         assert_equivalent(&[otap_to_otlp(&result)], &[otap_to_otlp(&expected)]);
+    }
+
+    /// Exercise the `resource_attr_dropped` counter via an `include`
+    /// `resource_attributes` rule. The fixture has two resources: one whose
+    /// `service.name` matches and one that does not. All spans from the
+    /// non-matching resource are expected to be reported as dropped solely
+    /// due to the resource-attribute mismatch.
+    #[test]
+    fn test_filter_include_resource_attr_dropped() {
+        let include = TraceMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValue::new(
+                "service.name".to_string(),
+                FilterAnyValue::String("match".to_string()),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let filter = TraceFilter::new(Some(include), None);
+
+        let matching_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("match"),
+                )])
+                .finish(),
+        );
+        let other_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("other"),
+                )])
+                .finish(),
+        );
+
+        let matching_spans = vec![
+            Span::build().name("a").finish(),
+            Span::build().name("b").finish(),
+        ];
+        let other_spans = vec![
+            Span::build().name("c").finish(),
+            Span::build().name("d").finish(),
+            Span::build().name("e").finish(),
+        ];
+
+        let traces_data = TracesData {
+            resource_spans: vec![
+                ResourceSpans {
+                    resource: matching_resource,
+                    scope_spans: vec![ScopeSpans {
+                        spans: matching_spans.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceSpans {
+                    resource: other_resource,
+                    scope_spans: vec![ScopeSpans {
+                        spans: other_spans.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
+        let (result, spans_consumed, spans_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
+
+        assert_eq!(spans_consumed, 5);
+        // All 3 spans from the "other" resource are eliminated.
+        assert_eq!(spans_filtered, 3);
+        // Those 3 spans were dropped purely because their resource row failed
+        // the resource_attributes rule (no record-level filter is configured).
+        assert_eq!(resource_attr_dropped, 3);
+
+        // Confirm survivors are exactly the spans from the matching resource.
+        let expected = otlp_to_otap(&OtlpProtoMessage::Traces(TracesData {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(
+                    Resource::build()
+                        .attributes(vec![ProtoKeyValue::new(
+                            "service.name",
+                            ProtoAnyValue::new_string("match"),
+                        )])
+                        .finish(),
+                ),
+                scope_spans: vec![ScopeSpans {
+                    spans: matching_spans,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+        assert_equivalent(&[otap_to_otlp(&result)], &[otap_to_otlp(&expected)]);
+    }
+
+    /// Same setup as the include test but using an `exclude` rule: the
+    /// matching resource's spans are eliminated. `resource_attr_dropped`
+    /// should equal the number of spans from the matching resource.
+    #[test]
+    fn test_filter_exclude_resource_attr_dropped() {
+        let exclude = TraceMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValue::new(
+                "service.name".to_string(),
+                FilterAnyValue::String("match".to_string()),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let filter = TraceFilter::new(None, Some(exclude));
+
+        let matching_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("match"),
+                )])
+                .finish(),
+        );
+        let other_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("other"),
+                )])
+                .finish(),
+        );
+
+        let matching_spans = vec![
+            Span::build().name("a").finish(),
+            Span::build().name("b").finish(),
+        ];
+        let other_spans = vec![
+            Span::build().name("c").finish(),
+            Span::build().name("d").finish(),
+            Span::build().name("e").finish(),
+        ];
+
+        let traces_data = TracesData {
+            resource_spans: vec![
+                ResourceSpans {
+                    resource: matching_resource,
+                    scope_spans: vec![ScopeSpans {
+                        spans: matching_spans.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceSpans {
+                    resource: other_resource,
+                    scope_spans: vec![ScopeSpans {
+                        spans: other_spans.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
+        let (result, spans_consumed, spans_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
+
+        assert_eq!(spans_consumed, 5);
+        assert_eq!(spans_filtered, 2);
+        assert_eq!(resource_attr_dropped, 2);
+
+        let expected = otlp_to_otap(&OtlpProtoMessage::Traces(TracesData {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(
+                    Resource::build()
+                        .attributes(vec![ProtoKeyValue::new(
+                            "service.name",
+                            ProtoAnyValue::new_string("other"),
+                        )])
+                        .finish(),
+                ),
+                scope_spans: vec![ScopeSpans {
+                    spans: other_spans,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+        assert_equivalent(&[otap_to_otlp(&result)], &[otap_to_otlp(&expected)]);
+    }
+
+    /// Lock in the invariant that `resource_attr_dropped` and
+    /// `spans_filtered` can diverge when record-level filters also drop
+    /// additional rows. Setup: matching resource has 4 spans (2 named
+    /// "keep", 2 named "drop"); non-matching resource has 3 spans. The
+    /// include rule combines a resource_attributes filter and a span_names
+    /// filter.
+    /// Expected: `resource_attr_dropped = 3` (only the non-matching
+    /// resource's spans), `spans_filtered = 5` (those 3 plus the 2 from the
+    /// matching resource named "drop").
+    #[test]
+    fn test_filter_resource_attr_dropped_less_than_spans_filtered() {
+        let include = TraceMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValue::new(
+                "service.name".to_string(),
+                FilterAnyValue::String("match".to_string()),
+            )],
+            Vec::new(),
+            vec!["keep".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let filter = TraceFilter::new(Some(include), None);
+
+        let matching_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("match"),
+                )])
+                .finish(),
+        );
+        let other_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("other"),
+                )])
+                .finish(),
+        );
+
+        let matching_spans = vec![
+            Span::build().name("keep").finish(),
+            Span::build().name("keep").finish(),
+            Span::build().name("drop").finish(),
+            Span::build().name("drop").finish(),
+        ];
+        // span name on these does not matter; they are eliminated at the
+        // resource step.
+        let other_spans = vec![
+            Span::build().name("keep").finish(),
+            Span::build().name("keep").finish(),
+            Span::build().name("keep").finish(),
+        ];
+
+        let traces_data = TracesData {
+            resource_spans: vec![
+                ResourceSpans {
+                    resource: matching_resource,
+                    scope_spans: vec![ScopeSpans {
+                        spans: matching_spans,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceSpans {
+                    resource: other_resource,
+                    scope_spans: vec![ScopeSpans {
+                        spans: other_spans,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Traces(traces_data));
+        let (_, spans_consumed, spans_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
+
+        assert_eq!(spans_consumed, 7);
+        // 3 from non-matching resource + 2 from matching resource named "drop".
+        assert_eq!(spans_filtered, 5);
+        // Only the 3 spans belonging to the non-matching resource are
+        // attributed to a resource-attr drop.
+        assert_eq!(resource_attr_dropped, 3);
+        assert!(resource_attr_dropped < spans_filtered);
     }
 }

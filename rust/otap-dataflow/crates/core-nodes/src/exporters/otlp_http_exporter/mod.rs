@@ -418,10 +418,26 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                         SignalType::Traces => &traces_endpoint,
                     });
 
+                    let payload_size_bytes = body.len();
+                    let log_payload_size = self.config.log_payload_size;
+
                     let max_response_body_len = self.config.max_response_body_length;
 
                     let client = client_pool.get_client();
                     inflight_exports.push(async move {
+                        if log_payload_size {
+                            let signal_type_name = match signal_type {
+                                SignalType::Logs => "logs",
+                                SignalType::Metrics => "metrics",
+                                SignalType::Traces => "traces",
+                            };
+                            otel_info!(
+                                "otlp.exporter.http.export_payload_size",
+                                signal_type = signal_type_name,
+                                payload_size_bytes = payload_size_bytes,
+                            );
+                        }
+
                         let mut req = client.post(endpoint.as_str()).body(body);
                         if let Some(method) = compression {
                             req = req.header(
@@ -1137,6 +1153,7 @@ mod test {
             client_pool_size: NonZeroUsize::try_from(2).unwrap(),
             max_response_body_length: 1024,
             max_in_flight: 10,
+            log_payload_size: false,
             traces_endpoint: None,
             metrics_endpoint: None,
             logs_endpoint: None,

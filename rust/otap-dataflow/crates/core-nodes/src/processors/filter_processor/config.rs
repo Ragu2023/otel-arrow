@@ -16,6 +16,12 @@ pub struct Config {
     logs: LogFilter,
     #[serde(default = "default_trace_filter")]
     traces: TraceFilter,
+    /// When true, emit an info-level log for every batch in which one or more
+    /// records were dropped because their resource attributes did not match
+    /// the configured `resource_attributes` selector. Defaults to false to
+    /// avoid noisy per-batch logging in production.
+    #[serde(default)]
+    log_dropped_messages: bool,
 }
 
 /// create empty log filter as default value
@@ -39,6 +45,7 @@ impl Config {
             metrics: MetricFilter::new(None, None),
             logs,
             traces,
+            log_dropped_messages: false,
         }
     }
 
@@ -51,6 +58,7 @@ impl Config {
             metrics,
             logs,
             traces,
+            log_dropped_messages: false,
         }
     }
 
@@ -67,5 +75,10 @@ impl Config {
     #[must_use]
     pub const fn trace_filters(&self) -> &TraceFilter {
         &self.traces
+    }
+
+    #[must_use]
+    pub const fn log_dropped_messages(&self) -> bool {
+        self.log_dropped_messages
     }
 }

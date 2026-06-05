@@ -1121,6 +1121,50 @@ fn update_parent_record_batch_filter(
         .map_err(|e| Error::ColumnLengthMismatch { source: e })
 }
 
+/// count_resource_attr_only_drops() returns how many rows of the top-level
+/// record batch (logs/spans) would be dropped *solely* because their resource
+/// row does not satisfy the configured `resource_attr_filter`. It isolates
+/// resource-attribute mismatches from record/attribute/severity-based drops by
+/// propagating only the resource filter onto an otherwise all-true parent
+/// filter and comparing `true_count` against the total row count.
+///
+/// Returns 0 when no resource-attribute filtering is in effect (all-true
+/// `resource_attr_filter`).
+fn count_resource_attr_only_drops(
+    top_level_rows: usize,
+    resource_attrs: Option<&RecordBatch>,
+    top_level_resource_ids_column: Option<&Arc<dyn Array>>,
+    resource_attr_filter: &BooleanArray,
+) -> Result<u64> {
+    let total = top_level_rows as u64;
+    let all_true = BooleanArray::from(BooleanBuffer::new_set(top_level_rows));
+    let after = match resource_attrs {
+        Some(resource_attrs_record_batch) => {
+            let id_column = top_level_resource_ids_column.ok_or_else(|| Error::ColumnNotFound {
+                name: format!("{}.{}", consts::RESOURCE, consts::ID),
+            })?;
+            update_parent_record_batch_filter(
+                resource_attrs_record_batch,
+                id_column,
+                resource_attr_filter,
+                &all_true,
+            )?
+        }
+        None => {
+            // No ResourceAttrs batch: either all rows survive the resource
+            // step (filter is all-true) or none do (filter is all-false). The
+            // submodule callers preserve this same semantics in their early
+            // returns.
+            if resource_attr_filter.true_count() == 0 {
+                BooleanArray::from(BooleanBuffer::new_unset(top_level_rows))
+            } else {
+                all_true
+            }
+        }
+    };
+    Ok(total - after.true_count() as u64)
+}
+
 /// new_child_record_batch_filter() takes an child record batch,
 /// id column from the parent record batch, and the parent record batch filter.
 /// This function extracts the masked id from the parent record batch and uses these ids to

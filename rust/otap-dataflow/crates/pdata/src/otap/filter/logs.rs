@@ -105,11 +105,18 @@ impl LogFilter {
 
     /// take a logs payload and return the filtered result
     ///
-    /// returns tuple of (filtered batch, logs_consumed, logs_filtered)
+    /// returns tuple of `(filtered batch, logs_consumed, logs_filtered,
+    /// logs_dropped_by_resource_attr_mismatch)`.
+    ///
+    /// `logs_dropped_by_resource_attr_mismatch` counts how many of the
+    /// removed log records were eliminated specifically because their resource
+    /// row did not satisfy the configured `resource_attributes` rules (it
+    /// excludes drops caused only by record-level filters). When no
+    /// resource-attribute rule is configured this is `0`.
     pub fn filter(
         &self,
         mut logs_payload: OtapArrowRecords,
-    ) -> Result<(OtapArrowRecords, u64, u64)> {
+    ) -> Result<(OtapArrowRecords, u64, u64, u64)> {
         let (resource_attr_filter, log_record_filter, log_attr_filter) = if let Some(include_config) =
             &self.include
             && let Some(exclude_config) = &self.exclude
@@ -148,7 +155,27 @@ impl LogFilter {
                     payload_type: ArrowPayloadType::Logs,
                 })?
                 .num_rows() as u64;
-            return Ok((logs_payload, num_rows, num_rows));
+            return Ok((logs_payload, num_rows, num_rows, 0));
+        };
+
+        // Capture, before any record/attribute filters narrow the surviving
+        // row set, how many log records would be eliminated purely because
+        // their resource row failed the resource_attributes rules.
+        let resource_attr_dropped = {
+            let log_records = logs_payload
+                .get(ArrowPayloadType::Logs)
+                .ok_or_else(|| Error::LogRecordNotFound {})?;
+            let resource_ids = get_optional_array_from_struct_array_from_record_batch(
+                log_records,
+                consts::RESOURCE,
+                consts::ID,
+            )?;
+            crate::otap::filter::count_resource_attr_only_drops(
+                log_records.num_rows(),
+                logs_payload.get(ArrowPayloadType::ResourceAttrs),
+                resource_ids,
+                &resource_attr_filter,
+            )?
         };
 
         let (log_record_filter, child_record_batch_filters) = self.sync_up_filters(
@@ -168,7 +195,12 @@ impl LogFilter {
             let (_, _) = apply_filter(&mut logs_payload, payload_type, &filter)?;
         }
 
-        Ok((logs_payload, log_rows_before, log_rows_removed))
+        Ok((
+            logs_payload,
+            log_rows_before,
+            log_rows_removed,
+            resource_attr_dropped,
+        ))
     }
 
     /// this function takes the filters for each record batch and makes sure that incomplete
@@ -548,7 +580,11 @@ mod test {
     use super::*;
     use crate::otap::filter::MatchType;
     use crate::proto::OtlpProtoMessage;
+    use crate::proto::opentelemetry::common::v1::{
+        AnyValue as ProtoAnyValue, KeyValue as ProtoKeyValue,
+    };
     use crate::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
+    use crate::proto::opentelemetry::resource::v1::Resource;
 
     use crate::testing::equiv::assert_equivalent;
     use crate::testing::round_trip::{otap_to_otlp, otlp_to_otap};
@@ -586,9 +622,11 @@ mod test {
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
-        let (result, logs_consumed, logs_filtered) = filter.filter(input).unwrap();
+        let (result, logs_consumed, logs_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
         assert_eq!(logs_consumed, 4);
         assert_eq!(logs_filtered, 2);
+        assert_eq!(resource_attr_dropped, 0);
 
         let expected = otlp_to_otap(&OtlpProtoMessage::Logs(LogsData {
             resource_logs: vec![ResourceLogs {
@@ -636,9 +674,11 @@ mod test {
 
         let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
 
-        let (result, logs_consumed, logs_filtered) = filter.filter(input).unwrap();
+        let (result, logs_consumed, logs_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
         assert_eq!(logs_consumed, 4);
         assert_eq!(logs_filtered, 2);
+        assert_eq!(resource_attr_dropped, 0);
 
         let expected = otlp_to_otap(&OtlpProtoMessage::Logs(LogsData {
             resource_logs: vec![ResourceLogs {
@@ -651,5 +691,301 @@ mod test {
         }));
 
         assert_equivalent(&[otap_to_otlp(&result)], &[otap_to_otlp(&expected)]);
+    }
+
+    /// Exercise the `resource_attr_dropped` counter via an `include`
+    /// `resource_attributes` rule. The fixture has two resources: one whose
+    /// `service.name` matches and one that does not. All log records from
+    /// the non-matching resource are expected to be reported as dropped
+    /// solely due to the resource-attribute mismatch.
+    #[test]
+    fn test_filter_include_resource_attr_dropped() {
+        let include = LogMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValue::new(
+                "service.name".to_string(),
+                AnyValue::String("match".to_string()),
+            )],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        let filter = LogFilter::new(Some(include), None, Vec::new());
+
+        let matching_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("match"),
+                )])
+                .finish(),
+        );
+        let other_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("other"),
+                )])
+                .finish(),
+        );
+
+        let matching_records = vec![
+            LogRecord::build().severity_text("INFO").finish(),
+            LogRecord::build().severity_text("INFO").finish(),
+        ];
+        let other_records = vec![
+            LogRecord::build().severity_text("INFO").finish(),
+            LogRecord::build().severity_text("INFO").finish(),
+            LogRecord::build().severity_text("INFO").finish(),
+        ];
+
+        let logs_data = LogsData {
+            resource_logs: vec![
+                ResourceLogs {
+                    resource: matching_resource,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: matching_records.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    resource: other_resource,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: other_records.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
+        let (result, logs_consumed, logs_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
+
+        assert_eq!(logs_consumed, 5);
+        // All 3 records from the "other" resource are eliminated.
+        assert_eq!(logs_filtered, 3);
+        // Those 3 records were dropped purely because their resource row
+        // failed the resource_attributes rule (no record-level filter is
+        // configured).
+        assert_eq!(resource_attr_dropped, 3);
+
+        // Confirm survivors are exactly the records from the matching resource.
+        let expected = otlp_to_otap(&OtlpProtoMessage::Logs(LogsData {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(
+                    Resource::build()
+                        .attributes(vec![ProtoKeyValue::new(
+                            "service.name",
+                            ProtoAnyValue::new_string("match"),
+                        )])
+                        .finish(),
+                ),
+                scope_logs: vec![ScopeLogs {
+                    log_records: matching_records,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+        assert_equivalent(&[otap_to_otlp(&result)], &[otap_to_otlp(&expected)]);
+    }
+
+    /// Same setup as the include test but using an `exclude` rule: the
+    /// matching resource's records are eliminated. `resource_attr_dropped`
+    /// should equal the number of records from the matching resource.
+    #[test]
+    fn test_filter_exclude_resource_attr_dropped() {
+        let exclude = LogMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValue::new(
+                "service.name".to_string(),
+                AnyValue::String("match".to_string()),
+            )],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        let filter = LogFilter::new(None, Some(exclude), Vec::new());
+
+        let matching_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("match"),
+                )])
+                .finish(),
+        );
+        let other_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("other"),
+                )])
+                .finish(),
+        );
+
+        let matching_records = vec![
+            LogRecord::build().severity_text("INFO").finish(),
+            LogRecord::build().severity_text("INFO").finish(),
+        ];
+        let other_records = vec![
+            LogRecord::build().severity_text("INFO").finish(),
+            LogRecord::build().severity_text("INFO").finish(),
+            LogRecord::build().severity_text("INFO").finish(),
+        ];
+
+        let logs_data = LogsData {
+            resource_logs: vec![
+                ResourceLogs {
+                    resource: matching_resource,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: matching_records.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    resource: other_resource,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: other_records.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
+        let (result, logs_consumed, logs_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
+
+        assert_eq!(logs_consumed, 5);
+        assert_eq!(logs_filtered, 2);
+        assert_eq!(resource_attr_dropped, 2);
+
+        let expected = otlp_to_otap(&OtlpProtoMessage::Logs(LogsData {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(
+                    Resource::build()
+                        .attributes(vec![ProtoKeyValue::new(
+                            "service.name",
+                            ProtoAnyValue::new_string("other"),
+                        )])
+                        .finish(),
+                ),
+                scope_logs: vec![ScopeLogs {
+                    log_records: other_records,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+        assert_equivalent(&[otap_to_otlp(&result)], &[otap_to_otlp(&expected)]);
+    }
+
+    /// Lock in the invariant that `resource_attr_dropped` and `logs_filtered`
+    /// can diverge when record-level filters also drop additional rows.
+    /// Setup: matching resource has 4 records (2 pass record_attributes, 2
+    /// don't); non-matching resource has 3 records. The include rule
+    /// combines a resource filter and a record_attributes filter.
+    /// Expected: `resource_attr_dropped = 3` (only the non-matching
+    /// resource's rows), `logs_filtered = 5` (those 3 plus the 2 from the
+    /// matching resource that fail the record_attributes rule).
+    #[test]
+    fn test_filter_resource_attr_dropped_less_than_logs_filtered() {
+        let include = LogMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValue::new(
+                "service.name".to_string(),
+                AnyValue::String("match".to_string()),
+            )],
+            vec![KeyValue::new(
+                "keep".to_string(),
+                AnyValue::Boolean(true),
+            )],
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        let filter = LogFilter::new(Some(include), None, Vec::new());
+
+        let matching_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("match"),
+                )])
+                .finish(),
+        );
+        let other_resource = Some(
+            Resource::build()
+                .attributes(vec![ProtoKeyValue::new(
+                    "service.name",
+                    ProtoAnyValue::new_string("other"),
+                )])
+                .finish(),
+        );
+
+        let kept = LogRecord::build()
+            .attributes(vec![ProtoKeyValue::new(
+                "keep",
+                ProtoAnyValue::new_bool(true),
+            )])
+            .finish();
+        let dropped = LogRecord::build()
+            .attributes(vec![ProtoKeyValue::new(
+                "keep",
+                ProtoAnyValue::new_bool(false),
+            )])
+            .finish();
+
+        let matching_records = vec![
+            kept.clone(),
+            kept.clone(),
+            dropped.clone(),
+            dropped.clone(),
+        ];
+        // record_attributes content does not matter for the non-matching
+        // resource; those records are eliminated at the resource step.
+        let other_records = vec![kept.clone(), kept.clone(), kept.clone()];
+
+        let logs_data = LogsData {
+            resource_logs: vec![
+                ResourceLogs {
+                    resource: matching_resource,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: matching_records,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    resource: other_resource,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: other_records,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
+        let (_, logs_consumed, logs_filtered, resource_attr_dropped) =
+            filter.filter(input).unwrap();
+
+        assert_eq!(logs_consumed, 7);
+        // 3 from non-matching resource + 2 from matching resource that fail
+        // the record_attributes rule.
+        assert_eq!(logs_filtered, 5);
+        // Only the 3 records belonging to the non-matching resource are
+        // attributed to a resource-attr drop.
+        assert_eq!(resource_attr_dropped, 3);
+        assert!(resource_attr_dropped < logs_filtered);
     }
 }

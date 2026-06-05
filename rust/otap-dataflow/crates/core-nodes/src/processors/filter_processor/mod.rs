@@ -30,6 +30,7 @@ use otap_df_pdata::TryIntoWithOptions;
 use otap_df_pdata::otap::OtapArrowRecords;
 use otap_df_pdata::otap::filter::IdBitmapPool;
 use otap_df_telemetry::metrics::MetricSet;
+use otap_df_telemetry::otel_info;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -143,11 +144,12 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                 let mut arrow_records: OtapArrowRecords = payload.try_into_with_default()?;
                 arrow_records.decode_transport_optimized_ids()?;
 
-                let (filtered_arrow_records, signals_consumed, signals_filtered): (
-                    OtapArrowRecords,
-                    u64,
-                    u64,
-                ) =
+                let (
+                    filtered_arrow_records,
+                    signals_consumed,
+                    signals_filtered,
+                    resource_attr_dropped,
+                ): (OtapArrowRecords, u64, u64, u64) =
                     effect_handler.timed(&self.compute_duration, || -> Result<_, Error> {
                         match signal {
                             SignalType::Metrics => {
@@ -164,10 +166,11 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                             source_detail,
                                         }
                                     })?;
-                                Ok((filtered, consumed, filtered_count))
+                                // MetricFilter has no resource_attributes config -> always 0.
+                                Ok((filtered, consumed, filtered_count, 0u64))
                             }
                             SignalType::Logs => {
-                                let (filtered, consumed, filtered_count) =
+                                let (filtered, consumed, filtered_count, resource_attr_dropped) =
                                     self.config.log_filters().filter(arrow_records).map_err(
                                         |e| {
                                             let source_detail = format_error_sources(&e);
@@ -179,10 +182,10 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                             }
                                         },
                                     )?;
-                                Ok((filtered, consumed, filtered_count))
+                                Ok((filtered, consumed, filtered_count, resource_attr_dropped))
                             }
                             SignalType::Traces => {
-                                let (filtered, consumed, filtered_count) =
+                                let (filtered, consumed, filtered_count, resource_attr_dropped) =
                                     self.config.trace_filters().filter(arrow_records).map_err(
                                         |e| {
                                             let source_detail = format_error_sources(&e);
@@ -194,7 +197,7 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                                             }
                                         },
                                     )?;
-                                Ok((filtered, consumed, filtered_count))
+                                Ok((filtered, consumed, filtered_count, resource_attr_dropped))
                             }
                         }
                     })?;
@@ -212,6 +215,34 @@ impl local::Processor<OtapPdata> for FilterProcessor {
                         self.metrics.span_signals_consumed.add(signals_consumed);
                         self.metrics.span_signals_filtered.add(signals_filtered);
                     }
+                }
+
+                // Surface resource-attribute-mismatch drops as a per-batch info
+                // log so operators can see at a glance how many records their
+                // resource_attributes rules removed -- distinct from drops
+                // caused by record-level filters.
+                if resource_attr_dropped > 0 && self.config.log_dropped_messages() {
+                    let signal_name = match signal {
+                        SignalType::Logs => "logs",
+                        SignalType::Metrics => "metrics",
+                        SignalType::Traces => "traces",
+                    };
+                    otel_info!(
+                        "processor.filter.resource_attr_mismatch_dropped",
+                        processor = %effect_handler.processor_id(),
+                        signal_type = signal_name,
+                        consumed = signals_consumed,
+                        filtered = signals_filtered,
+                        dropped = resource_attr_dropped,
+                    );
+                }
+
+                let remaining = signals_consumed.saturating_sub(signals_filtered);
+                if remaining == 0 {
+                    // Entire batch was eliminated by the filter; do not
+                    // propagate an empty payload downstream (which would
+                    // otherwise produce empty OTLP exports on the wire).
+                    return Ok(());
                 }
 
                 effect_handler
@@ -1838,5 +1869,288 @@ mod tests {
             .set_processor(processor)
             .run_test(scenario_traces(expected_data))
             .validate(validation_procedure());
+    }
+
+    // ---------------------------------------------------------------------
+    // Tests for: empty-batch suppression and the `log_dropped_messages`
+    // YAML/config flag added to FilterProcessor.
+    // ---------------------------------------------------------------------
+
+    /// Scenario helper: send `sent` logs and assert NO downstream message is
+    /// emitted (i.e. the processor suppressed an otherwise-empty batch).
+    fn scenario_logs_no_output(
+        sent: LogsData,
+    ) -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |mut ctx| {
+            Box::pin(async move {
+                let mut bytes = vec![];
+                sent.encode(&mut bytes)
+                    .expect("failed to encode log data into bytes");
+                let otlp_logs_bytes =
+                    OtapPdata::new_default(OtlpProtoBytes::ExportLogsRequest(bytes.into()).into());
+                ctx.process(Message::PData(otlp_logs_bytes))
+                    .await
+                    .expect("failed to process");
+                let msgs = ctx.drain_pdata().await;
+                assert!(
+                    msgs.is_empty(),
+                    "expected no downstream messages when entire log batch is filtered, got {}",
+                    msgs.len()
+                );
+            })
+        }
+    }
+
+    /// Scenario helper: send a `MetricsData` batch and assert NO downstream
+    /// message is emitted.
+    fn scenario_metrics_no_output(
+        sent: MetricsData,
+    ) -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |mut ctx| {
+            Box::pin(async move {
+                let mut bytes = vec![];
+                sent.encode(&mut bytes)
+                    .expect("failed to encode metrics data into bytes");
+                let otlp_metrics_bytes = OtapPdata::new_default(
+                    OtlpProtoBytes::ExportMetricsRequest(bytes.into()).into(),
+                );
+                ctx.process(Message::PData(otlp_metrics_bytes))
+                    .await
+                    .expect("failed to process");
+                let msgs = ctx.drain_pdata().await;
+                assert!(
+                    msgs.is_empty(),
+                    "expected no downstream messages when entire metrics batch is filtered, got {}",
+                    msgs.len()
+                );
+            })
+        }
+    }
+
+    /// Scenario helper: send the canonical traces fixture and assert NO
+    /// downstream message is emitted.
+    fn scenario_traces_no_output()
+    -> impl FnOnce(TestContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |mut ctx| {
+            Box::pin(async move {
+                let traces_data = build_traces();
+                let mut bytes = vec![];
+                traces_data
+                    .encode(&mut bytes)
+                    .expect("failed to encode trace data into bytes");
+                let otlp_traces_bytes = OtapPdata::new_default(
+                    OtlpProtoBytes::ExportTracesRequest(bytes.into()).into(),
+                );
+                ctx.process(Message::PData(otlp_traces_bytes))
+                    .await
+                    .expect("failed to process");
+                let msgs = ctx.drain_pdata().await;
+                assert!(
+                    msgs.is_empty(),
+                    "expected no downstream messages when entire traces batch is filtered, got {}",
+                    msgs.len()
+                );
+            })
+        }
+    }
+
+    /// When the include filter matches no metric, all data points are dropped
+    /// and the processor MUST NOT forward an empty payload downstream.
+    #[test]
+    fn test_filter_processor_metrics_all_dropped_emits_nothing() {
+        let test_runtime = TestRuntime::new();
+
+        let metric_props =
+            MetricMatchProperties::new(MatchType::Strict, vec!["does.not.exist".into()]);
+        let metric_filter = MetricFilter::new(Some(metric_props), None);
+        let log_filter = LogFilter::new(None, None, Vec::new());
+        let trace_filter = TraceFilter::new(None, None);
+        let config = Config::new_with_metrics(metric_filter, log_filter, trace_filter);
+
+        let user_config = Arc::new(NodeUserConfig::new_processor_config(FILTER_PROCESSOR_URN));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = ProcessorWrapper::local(
+            FilterProcessor::new(config, pipeline_ctx),
+            test_node(test_runtime.config().name.clone()),
+            user_config,
+            test_runtime.config(),
+        );
+
+        let sent = build_metrics(&["test.counter1", "test.counter2", "test.counter3"]);
+
+        test_runtime
+            .set_processor(processor)
+            .run_test(scenario_metrics_no_output(sent))
+            .validate(validation_procedure());
+    }
+
+    /// When the include filter matches no resource, all log rows are dropped
+    /// and the processor MUST NOT forward an empty payload downstream.
+    #[test]
+    fn test_filter_processor_logs_all_dropped_emits_nothing() {
+        let test_runtime = TestRuntime::new();
+
+        // include rule that no resource in build_logs_1() satisfies
+        let include_props = LogMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValueFilter::new(
+                "service.name".to_string(),
+                AnyValueFilter::String("does-not-exist".to_string()),
+            )],
+            vec![],
+            vec![],
+            None,
+            vec![],
+        );
+        let log_filter = LogFilter::new(Some(include_props), None, Vec::new());
+        let trace_filter = TraceFilter::new(None, None);
+        let config = Config::new(log_filter, trace_filter);
+
+        let user_config = Arc::new(NodeUserConfig::new_processor_config(FILTER_PROCESSOR_URN));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = ProcessorWrapper::local(
+            FilterProcessor::new(config, pipeline_ctx),
+            test_node(test_runtime.config().name.clone()),
+            user_config,
+            test_runtime.config(),
+        );
+
+        test_runtime
+            .set_processor(processor)
+            .run_test(scenario_logs_no_output(build_logs_1()))
+            .validate(validation_procedure());
+    }
+
+    /// When the include filter matches no resource, all spans are dropped and
+    /// the processor MUST NOT forward an empty payload downstream.
+    #[test]
+    fn test_filter_processor_traces_all_dropped_emits_nothing() {
+        let test_runtime = TestRuntime::new();
+
+        let include_props = TraceMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValueFilter::new(
+                "service.name".to_string(),
+                AnyValueFilter::String("does-not-exist".to_string()),
+            )],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let trace_filter = TraceFilter::new(Some(include_props), None);
+        let log_filter = LogFilter::new(None, None, Vec::new());
+        let config = Config::new(log_filter, trace_filter);
+
+        let user_config = Arc::new(NodeUserConfig::new_processor_config(FILTER_PROCESSOR_URN));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = ProcessorWrapper::local(
+            FilterProcessor::new(config, pipeline_ctx),
+            test_node(test_runtime.config().name.clone()),
+            user_config,
+            test_runtime.config(),
+        );
+
+        test_runtime
+            .set_processor(processor)
+            .run_test(scenario_traces_no_output())
+            .validate(validation_procedure());
+    }
+
+    /// Sanity guard for the suppression logic: when at least one record
+    /// survives the filter, the (non-empty) batch IS forwarded downstream.
+    /// Reuses the existing include-only logs fixture and asserts the
+    /// processor emits exactly one message.
+    #[test]
+    fn test_filter_processor_logs_partial_drop_still_emits() {
+        let test_runtime = TestRuntime::new();
+
+        // Include only one of the two resources in build_logs_1().
+        let include_props = LogMatchProperties::new(
+            MatchType::Strict,
+            vec![KeyValueFilter::new(
+                "service.name".to_string(),
+                AnyValueFilter::String("checkout-service".to_string()),
+            )],
+            vec![],
+            vec![],
+            None,
+            vec![],
+        );
+        let log_filter = LogFilter::new(Some(include_props), None, Vec::new());
+        let trace_filter = TraceFilter::new(None, None);
+        let config = Config::new(log_filter, trace_filter);
+
+        let user_config = Arc::new(NodeUserConfig::new_processor_config(FILTER_PROCESSOR_URN));
+        let telemetry_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(telemetry_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let processor = ProcessorWrapper::local(
+            FilterProcessor::new(config, pipeline_ctx),
+            test_node(test_runtime.config().name.clone()),
+            user_config,
+            test_runtime.config(),
+        );
+
+        let scenario =
+            move |mut ctx: TestContext<OtapPdata>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async move {
+                    let mut bytes = vec![];
+                    build_logs_1()
+                        .encode(&mut bytes)
+                        .expect("failed to encode log data");
+                    let pdata = OtapPdata::new_default(
+                        OtlpProtoBytes::ExportLogsRequest(bytes.into()).into(),
+                    );
+                    ctx.process(Message::PData(pdata))
+                        .await
+                        .expect("failed to process");
+                    let msgs = ctx.drain_pdata().await;
+                    assert_eq!(
+                        msgs.len(),
+                        1,
+                        "expected exactly one downstream message when filter retains records"
+                    );
+                })
+            };
+
+        test_runtime
+            .set_processor(processor)
+            .run_test(scenario)
+            .validate(validation_procedure());
+    }
+
+    /// `log_dropped_messages` defaults to `false` when absent from YAML.
+    #[test]
+    fn test_config_log_dropped_messages_default_false() {
+        let cfg: Config = serde_json::from_value(json!({})).expect("empty config should parse");
+        assert!(!cfg.log_dropped_messages());
+    }
+
+    /// `log_dropped_messages: true` parses and is honored.
+    #[test]
+    fn test_config_log_dropped_messages_explicit_true() {
+        let cfg: Config = serde_json::from_value(json!({ "log_dropped_messages": true }))
+            .expect("config with log_dropped_messages should parse");
+        assert!(cfg.log_dropped_messages());
+    }
+
+    /// `log_dropped_messages: false` parses and is honored.
+    #[test]
+    fn test_config_log_dropped_messages_explicit_false() {
+        let cfg: Config = serde_json::from_value(json!({ "log_dropped_messages": false }))
+            .expect("config with log_dropped_messages=false should parse");
+        assert!(!cfg.log_dropped_messages());
     }
 }
