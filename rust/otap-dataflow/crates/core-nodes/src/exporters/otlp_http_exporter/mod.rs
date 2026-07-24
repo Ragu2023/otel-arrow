@@ -49,9 +49,10 @@ use otap_df_pdata::proto::opentelemetry::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceResponse,
 };
 use otap_df_pdata::{OtapPayload, OtapPayloadHelpers};
+use otap_df_telemetry::attributes::AttributeEnum;
 use otap_df_telemetry::common_attributes::{Outcome, SignalOutcomeAttributes};
 use otap_df_telemetry::metrics::MeasurementMetricSet;
-use otap_df_telemetry::{otel_debug, otel_info, otel_warn};
+use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use prost::Message as _;
 use reqwest::{Client, Response};
 use secrecy::ExposeSecret;
@@ -60,6 +61,7 @@ use self::config::Config;
 use crate::exporters::otlp_grpc_exporter::InFlightExports;
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::metrics::ExporterPDataExportMetrics;
+use otap_df_otap::otlp_http::bearer::{self, SharedBearerToken};
 use otap_df_otap::otlp_http::client_settings::{HttpClientError, HttpClientSettings};
 use otap_df_otap::otlp_http::{LOGS_PATH, METRICS_PATH, PROTOBUF_CONTENT_TYPE, TRACES_PATH};
 use otap_df_otap::pdata::{Context, OtapPdata};
@@ -100,6 +102,39 @@ fn validate_config(config: &serde_json::Value) -> Result<(), ConfigError> {
         .map_err(|e| ConfigError::InvalidUserConfig {
             error: e.to_string(),
         })?;
+    validate_bearer_auth(&cfg)?;
+    Ok(())
+}
+
+/// Validates the optional bearer-token authentication configuration.
+///
+/// Rejects configurations that would silently never attach a token: a file source without a
+/// path, and a static `authorization` header that would collide with the per-request bearer
+/// header.
+fn validate_bearer_auth(cfg: &Config) -> Result<(), ConfigError> {
+    let Some(bearer) = cfg.bearer_auth.as_ref() else {
+        return Ok(());
+    };
+    if !bearer.enabled {
+        return Ok(());
+    }
+    if matches!(bearer.source, config::BearerSource::File) && bearer.path.is_none() {
+        return Err(ConfigError::InvalidUserConfig {
+            error: "bearer_auth.path is required when bearer_auth.source is \"file\"".into(),
+        });
+    }
+    if cfg
+        .http
+        .headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("authorization"))
+    {
+        return Err(ConfigError::InvalidUserConfig {
+            error: "bearer_auth is enabled but a static \"authorization\" header is also \
+                configured; remove one to avoid a conflicting Authorization header"
+                .into(),
+        });
+    }
     Ok(())
 }
 
@@ -256,6 +291,31 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                 })?;
 
         let mut inflight_exports = InFlightExports::new();
+
+        // Resolve the refreshable bearer-token slot (if enabled) and start its source. The slot is
+        // read fresh on every request so out-of-band refreshes take effect without a restart.
+        let bearer_slot: Option<SharedBearerToken> = match self.config.bearer_auth.as_ref() {
+            Some(bearer) if bearer.enabled => {
+                let slot = match bearer.source {
+                    config::BearerSource::File => {
+                        // `path` is guaranteed present by `validate_bearer_auth`.
+                        let path = bearer.path.clone().unwrap_or_default();
+                        bearer::ensure_file_source(&bearer.id, path, bearer.reload)
+                    }
+                    config::BearerSource::Ffi => {
+                        // The external application publishes tokens directly via the FFI setter;
+                        // we only read from the shared slot.
+                        bearer::slot(&bearer.id)
+                    }
+                };
+                otel_info!(
+                    "otlp.exporter.http.bearer_auth.enabled",
+                    id = bearer.id.as_str(),
+                );
+                Some(slot)
+            }
+            _ => None,
+        };
 
         let mut logs_proto_encoder = LogsProtoBytesEncoder::new();
         let mut metrics_proto_encoder = MetricsProtoBytesEncoder::new();
@@ -455,6 +515,41 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
 
                     let max_response_body_len = self.config.max_response_body_length;
 
+                    // Read the current bearer token (if enabled) before spawning the request. A
+                    // missing token when auth is enabled is a hard failure: drop the payload with a
+                    // permanent NACK rather than send an unauthenticated request.
+                    let bearer_header: Option<Arc<HeaderValue>> = match bearer_slot.as_ref() {
+                        Some(slot) => {
+                            let guard = slot.load();
+                            match guard.as_ref() {
+                                Some(value) => Some(Arc::clone(value)),
+                                None => {
+                                    otel_error!(
+                                        "otlp.exporter.http.bearer_auth.token_missing",
+                                        message = "bearer auth is enabled but no token is \
+                                            available; dropping payload",
+                                        signal = signal_type.as_str(),
+                                    );
+                                    let mut nack = NackMsg::new(
+                                        "bearer auth enabled but no token available".to_string(),
+                                        OtapPdata::new(context, saved_payload),
+                                    );
+                                    nack.permanent = true;
+                                    _ = effect_handler.notify_nack(nack).await;
+                                    self.pdata_metrics
+                                        .with(SignalOutcomeAttributes {
+                                            signal: signal_type,
+                                            outcome: Outcome::Failure,
+                                        })
+                                        .messages
+                                        .inc();
+                                    continue;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+
                     let client = client_pool.get_client();
                     inflight_exports.push(async move {
                         let mut req = client.post(endpoint.as_str()).body(body);
@@ -463,6 +558,9 @@ impl Exporter<OtapPdata> for OtlpHttpExporter {
                                 http::header::CONTENT_ENCODING,
                                 method.as_http_content_encoding(),
                             );
+                        }
+                        if let Some(token) = bearer_header {
+                            req = req.header(http::header::AUTHORIZATION, (*token).clone());
                         }
                         let result = req.send().await;
 
@@ -1368,7 +1466,50 @@ mod test {
             traces_endpoint: None,
             metrics_endpoint: None,
             logs_endpoint: None,
+            bearer_auth: None,
         }
+    }
+
+    /// Scenario: bearer auth enabled with source=file but no path supplied.
+    /// Guarantees: config validation rejects it so a token would never load silently.
+    #[test]
+    fn test_validate_config_rejects_file_source_without_path() {
+        let cfg = serde_json::json!({
+            "endpoint": "http://localhost:4318",
+            "http": {},
+            "client_pool_size": 1,
+            "bearer_auth": { "enabled": true, "source": "file" }
+        });
+        let err = validate_config(&cfg).expect_err("should reject file source without path");
+        assert!(err.to_string().contains("bearer_auth.path is required"));
+    }
+
+    /// Scenario: bearer auth enabled alongside a static `authorization` header.
+    /// Guarantees: config validation rejects the conflicting Authorization sources.
+    #[test]
+    fn test_validate_config_rejects_conflicting_authorization_header() {
+        let cfg = serde_json::json!({
+            "endpoint": "http://localhost:4318",
+            "http": { "headers": { "authorization": "Basic abc" } },
+            "client_pool_size": 1,
+            "bearer_auth": { "enabled": true, "source": "ffi" }
+        });
+        let err =
+            validate_config(&cfg).expect_err("should reject conflicting authorization header");
+        assert!(err.to_string().contains("static \"authorization\" header"));
+    }
+
+    /// Scenario: bearer auth present but disabled.
+    /// Guarantees: validation passes and imposes no path/header constraints.
+    #[test]
+    fn test_validate_config_allows_disabled_bearer_auth() {
+        let cfg = serde_json::json!({
+            "endpoint": "http://localhost:4318",
+            "http": {},
+            "client_pool_size": 1,
+            "bearer_auth": { "enabled": false, "source": "file" }
+        });
+        validate_config(&cfg).expect("disabled bearer auth should validate");
     }
 
     #[test]
@@ -1574,6 +1715,161 @@ mod test {
                     server_cancellation_token.cancel();
                 })
             })
+    }
+
+    /// Scenario: bearer auth is enabled with a token published to the registry; a single logs
+    /// payload is exported to a header-capturing server.
+    /// Guarantees: the request carries `Authorization: Bearer <token>`, proving the refreshable
+    /// token is read per-request and applied on the wire.
+    #[test]
+    fn test_bearer_token_applied_on_wire() {
+        let id = "wire-applied-test";
+        bearer::set_token(id, Some("test-token-abc")).unwrap();
+
+        let port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let endpoint_addr = format!("127.0.0.1:{port}");
+        let endpoint = format!("http://{endpoint_addr}");
+
+        let tokio_rt = Runtime::new().unwrap();
+        let captured: Arc<parking_lot::Mutex<Option<HeaderMap>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let cancel = run_header_capture_server(&tokio_rt, &endpoint_addr, captured.clone());
+        wait_for_port_ready(&endpoint_addr);
+
+        let config = Config {
+            bearer_auth: Some(config::BearerAuthConfig {
+                enabled: true,
+                source: config::BearerSource::Ffi,
+                id: id.to_string(),
+                path: None,
+                reload: Duration::from_secs(5),
+            }),
+            ..default_test_config(endpoint)
+        };
+
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let (_pipeline_ctx, exporter) = setup_exporter(&test_runtime, config);
+
+        let (logs_batch, _, _) = gen_batches_for_each_signal_type();
+        let mut bytes = Vec::new();
+        logs_batch.encode(&mut bytes).unwrap();
+        let pdatas = subscribe_pdatas(
+            vec![OtapPdata::new_default(OtapPayload::OtlpBytes(
+                OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)),
+            ))],
+            false,
+        );
+
+        test_runtime
+            .set_exporter(exporter)
+            .run_test(|ctx| {
+                Box::pin(async move {
+                    for pdata in pdatas {
+                        ctx.send_pdata(pdata).await.unwrap();
+                    }
+                    ctx.send_shutdown(Instant::now() + Duration::from_millis(200), "done")
+                        .await
+                        .unwrap();
+                })
+            })
+            .run_validation(|_ctx, result| {
+                Box::pin(async move {
+                    result.unwrap();
+                    cancel.cancel();
+                    let headers = captured
+                        .lock()
+                        .clone()
+                        .expect("server did not capture any request headers");
+                    assert_eq!(
+                        headers
+                            .get(http::header::AUTHORIZATION)
+                            .expect("authorization header missing")
+                            .to_str()
+                            .unwrap(),
+                        "Bearer test-token-abc"
+                    );
+                })
+            });
+    }
+
+    /// Scenario: bearer auth is enabled but no token has been published; a logs payload is sent.
+    /// Guarantees: the exporter drops the payload with a permanent NACK and never contacts the
+    /// server, so unauthenticated requests are never emitted.
+    #[test]
+    fn test_bearer_token_missing_drops_with_nack() {
+        let id = "missing-drop-test";
+        // Ensure no token is present for this id.
+        bearer::set_token(id, None).unwrap();
+
+        let port = otap_df_test_net::pick_unused_loopback_tcp_port();
+        let endpoint_addr = format!("127.0.0.1:{port}");
+        let endpoint = format!("http://{endpoint_addr}");
+
+        let tokio_rt = Runtime::new().unwrap();
+        let captured: Arc<parking_lot::Mutex<Option<HeaderMap>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let cancel = run_header_capture_server(&tokio_rt, &endpoint_addr, captured.clone());
+        wait_for_port_ready(&endpoint_addr);
+
+        let config = Config {
+            bearer_auth: Some(config::BearerAuthConfig {
+                enabled: true,
+                source: config::BearerSource::Ffi,
+                id: id.to_string(),
+                path: None,
+                reload: Duration::from_secs(5),
+            }),
+            ..default_test_config(endpoint)
+        };
+
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let (_pipeline_ctx, exporter) = setup_exporter(&test_runtime, config);
+
+        let (logs_batch, _, _) = gen_batches_for_each_signal_type();
+        let mut bytes = Vec::new();
+        logs_batch.encode(&mut bytes).unwrap();
+        let pdatas = subscribe_pdatas(
+            vec![OtapPdata::new_default(OtapPayload::OtlpBytes(
+                OtlpProtoBytes::ExportLogsRequest(Bytes::from(bytes)),
+            ))],
+            false,
+        );
+
+        test_runtime
+            .set_exporter(exporter)
+            .run_test(|ctx| {
+                Box::pin(async move {
+                    for pdata in pdatas {
+                        ctx.send_pdata(pdata).await.unwrap();
+                    }
+                    ctx.send_shutdown(Instant::now() + Duration::from_millis(200), "done")
+                        .await
+                        .unwrap();
+                })
+            })
+            .run_validation(|mut ctx, result| {
+                Box::pin(async move {
+                    result.unwrap();
+
+                    let mut nack_count = 0;
+                    let mut pipeline_completion_rx =
+                        ctx.take_pipeline_completion_receiver().unwrap();
+                    match pipeline_completion_rx.recv().await {
+                        Ok(PipelineCompletionMsg::DeliverNack { .. }) => nack_count += 1,
+                        Ok(PipelineCompletionMsg::DeliverAck { .. }) => {
+                            panic!("unexpected Ack: missing token should drop, not ack")
+                        }
+                        Err(_) => {}
+                    }
+                    assert_eq!(nack_count, 1, "expected exactly one permanent NACK");
+
+                    cancel.cancel();
+                    assert!(
+                        captured.lock().is_none(),
+                        "server must not receive a request when the token is missing"
+                    );
+                })
+            });
     }
 
     fn run_error_status_code_test(status: u16, retryable: bool) {

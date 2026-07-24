@@ -53,6 +53,7 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use crate::tls_utils::build_tls_acceptor;
 use otap_df_config::tls::TlsServerConfig;
 
+pub mod bearer;
 pub mod client_settings;
 
 /// OTLP protobuf content type

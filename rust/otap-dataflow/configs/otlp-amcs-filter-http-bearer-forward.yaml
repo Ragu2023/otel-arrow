@@ -1,0 +1,94 @@
+version: otel_dataflow/v1
+engine: { }
+groups:
+  default:
+    pipelines:
+      main:
+        # OTLP receiver (gRPC + HTTP) -> filter(service.name=amcs) -> batch(1MiB) -> OTLP HTTP exporter
+        # The OTLP HTTP exporter attaches a refreshable "Authorization: Bearer <token>" header to
+        # every request. The token is owned and periodically refreshed out-of-band by an external
+        # process (e.g. a host C++ application) which rewrites the token file below. Requests are
+        # dropped (permanent NACK) whenever no token is available, so unauthenticated requests are
+        # never emitted.
+
+        policies:
+          channel_capacity:
+            control:
+              node: 100
+              pipeline: 100
+            pdata: 128
+
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  max_decoding_message_size: "64MiB"
+                http:
+                  listening_addr: "127.0.0.1:4318"
+                  max_request_body_size: "64MiB"
+
+          filter:
+            type: processor:filter
+            config:
+              log_dropped_messages: true
+              logs:
+                include:
+                  match_type: strict
+                  resource_attributes:
+                    - key: service.name
+                      value: amcs
+              traces:
+                include:
+                  match_type: strict
+                  resource_attributes:
+                    - key: service.name
+                      value: amcs
+                  span_names: []
+
+          batch:
+            type: processor:batch
+            config:
+              otlp:
+                sizer: bytes
+                min_size: 1048576
+                max_size: 1048576
+              max_batch_duration: 2000ms
+              format: otlp
+
+          exporter:
+            type: exporter:otlp_http
+            config:
+              http:
+                # optional to enable gzip compression for the payloads
+                # compression: gzip
+                headers:
+                  User-Agent: "DfEngine/1.0"
+                  azure-monitor-source-resourceId: "/subscriptions/00000000-0000000-00000/resourceGroups/CloudTest-rg/providers/Microsoft.KeyVault/vaults/KeyVault"
+                  x-ms-AzureRegion: "westus2"
+              # Refreshable bearer-token authentication.
+              #   source: file -> read the raw token from `path`, re-checking it every `reload`.
+              #                   (Swap to `source: ffi` later to receive the token in-process via
+              #                    df_engine_set_bearer_token() without any other config change.)
+              #   id:           registry key shared by all exporters/sources that use this token.
+              # Do NOT also set a static `authorization` header above; that is rejected at load time.
+              bearer_auth:
+                enabled: true
+                source: file
+                id: amcs
+                path: "C:\\Official_New\\Token\\amcs-bearer-token.txt"
+                reload: 5s
+              endpoint: "http://127.0.0.1:4320"
+              logs_endpoint: "http://127.0.0.1:4320/v1/logs"
+              traces_endpoint: "http://127.0.0.1:4320/v1/traces"
+              client_pool_size: 1
+
+        connections:
+          - from: receiver
+            to: filter
+          - from: filter
+            to: batch
+          - from: batch
+            to: exporter
