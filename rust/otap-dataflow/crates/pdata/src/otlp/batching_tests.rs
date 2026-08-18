@@ -5,6 +5,7 @@
 
 use crate::otlp::OtlpProtoBytes;
 use crate::otlp::batching::make_bytes_batches;
+use crate::otlp::batching::make_bytes_batches_from_owned;
 use crate::otlp::batching::make_bytes_batches_owned;
 use crate::proto::OtlpProtoMessage;
 use crate::proto::opentelemetry::common::v1::any_value::Value;
@@ -353,6 +354,146 @@ fn test_split_single_resource_many_records() {
         "records dropped, duplicated or reordered",
     );
     assert_equivalent(&[logs.into()], &out_msgs);
+}
+
+/// Scenario: an undersized split tail from one logs request is followed by
+/// another oversize logs request during sustained traffic.
+/// Guarantees: the next resource is split to fill the retained tail instead of
+/// exporting that tail as an avoidable small intermediate request, while
+/// preserving record order and ownership.
+#[test]
+fn test_retained_tail_is_filled_from_next_oversize_resource() {
+    let first_logs = single_resource_logs("first", 80);
+    let first = otlp_message_to_bytes(&first_logs.into());
+    let max_size = (first.num_bytes() / 5).max(1);
+    let mut first_split = make_bytes_batches_owned(
+        SignalType::Logs,
+        NonZeroU64::new(max_size as u64),
+        None,
+        None,
+        None,
+        vec![first],
+    )
+    .expect("split first request");
+    let (tail, tail_ownership) = first_split.batches.pop().expect("split tail");
+    let tail_size = tail.num_bytes();
+    assert!(tail_size < max_size, "test requires an undersized tail");
+
+    let second_logs = single_resource_logs("second", 80);
+    let second = otlp_message_to_bytes(&second_logs.into());
+    let second_ownership = second.num_bytes();
+    let expected = vec![
+        otlp_bytes_to_message(tail.clone()),
+        otlp_bytes_to_message(second.clone()),
+    ];
+    let output = make_bytes_batches_from_owned(
+        SignalType::Logs,
+        NonZeroU64::new(max_size as u64),
+        None,
+        None,
+        None,
+        vec![(tail, tail_ownership), (second, second_ownership)],
+    )
+    .expect("batch retained tail with next request");
+
+    assert!(
+        output.batches[0].0.num_bytes() > tail_size,
+        "the next oversize resource must contribute to the retained tail"
+    );
+    assert_eq!(
+        output
+            .batches
+            .iter()
+            .map(|(_, ownership)| ownership)
+            .sum::<usize>(),
+        tail_ownership + second_ownership
+    );
+    let actual = output
+        .batches
+        .into_iter()
+        .map(|(batch, _)| otlp_bytes_to_message(batch))
+        .collect::<Vec<_>>();
+    assert_eq!(log_bodies(&actual), log_bodies(&expected));
+}
+
+/// Scenario: one hundred consecutive oversize logs requests repeatedly follow
+/// an undersized retained tail, matching sustained high-throughput traffic.
+/// Guarantees: every new request contributes bytes to the previous tail before
+/// any output is emitted, later fragments remain near the configured maximum,
+/// and ownership remains exact across all iterations.
+#[test]
+fn test_sustained_oversize_requests_fill_each_retained_tail() {
+    const ITERATIONS: usize = 100;
+    let logs = single_resource_logs("sustained", 80);
+    let request = otlp_message_to_bytes(&logs.into());
+    let request_size = request.num_bytes();
+    let max_size = (request_size / 5).max(1);
+    let mut initial = make_bytes_batches_owned(
+        SignalType::Logs,
+        NonZeroU64::new(max_size as u64),
+        None,
+        None,
+        None,
+        vec![request.clone()],
+    )
+    .expect("split initial request");
+    let (mut retained, mut retained_ownership) =
+        initial.batches.pop().expect("initial retained tail");
+    let mut emitted_ownership = initial
+        .batches
+        .iter()
+        .map(|(_, ownership)| ownership)
+        .sum::<usize>();
+    let mut filled_tails = 0usize;
+
+    for iteration in 0..ITERATIONS {
+        let previous_tail_size = retained.num_bytes();
+        let mut output = make_bytes_batches_from_owned(
+            SignalType::Logs,
+            NonZeroU64::new(max_size as u64),
+            None,
+            None,
+            None,
+            vec![
+                (retained, retained_ownership),
+                (request.clone(), request_size),
+            ],
+        )
+        .expect("batch sustained request");
+        let (next_retained, next_retained_ownership) =
+            output.batches.pop().expect("next retained tail");
+        for (batch_index, (batch, _)) in output.batches.iter().enumerate() {
+            assert!(
+                batch.num_bytes() * 10 >= max_size * 9,
+                "iteration {iteration}, batch {batch_index}: intermediate batch {} is less than 90% of max {max_size}",
+                batch.num_bytes()
+            );
+        }
+        let first_size = output.batches.first().map(|(batch, _)| batch.num_bytes());
+        let first_size = first_size.expect("sustained input must emit output");
+        if first_size > previous_tail_size {
+            filled_tails += 1;
+        } else {
+            assert!(
+                previous_tail_size * 10 >= max_size * 9,
+                "iteration {iteration}: avoidable small tail {previous_tail_size} was emitted unchanged with max {max_size}"
+            );
+        }
+        emitted_ownership += output
+            .batches
+            .iter()
+            .map(|(_, ownership)| ownership)
+            .sum::<usize>();
+        retained = next_retained;
+        retained_ownership = next_retained_ownership;
+    }
+
+    assert_eq!(
+        emitted_ownership + retained_ownership,
+        request_size * (ITERATIONS + 1),
+        "ownership must remain exact across sustained rebatching"
+    );
+    assert!(filled_tails > 0, "the test must exercise tail filling");
 }
 
 /// Builds an OTLP logs request with `num_resources` `ResourceLogs`, each a single

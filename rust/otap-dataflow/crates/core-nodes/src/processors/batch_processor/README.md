@@ -161,6 +161,10 @@ runtime metric sets may also be attached by the pipeline telemetry policy.
 
 - `min_size` and `max_size`, when set, must be non-zero.
 - `bytes` sizing depends on payload formats that can report encoded size.
+- OTLP byte batching fills an undersized split tail from later resources before
+  exporting it. Only the first fragment uses the tail's residual capacity;
+  later fragments return to `max_size`, and only the final residual waits for
+  `max_batch_duration`.
 - `max_batch_duration: 0s` disables time-based accumulation and flushes
   immediately.
 

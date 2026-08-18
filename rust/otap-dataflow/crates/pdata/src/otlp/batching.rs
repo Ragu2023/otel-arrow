@@ -29,6 +29,11 @@ const CHILD_LIST_FIELD: u64 = 2;
 /// input (see `make_bytes_batches_owned`).
 type OwnedBatch = (OtlpProtoBytes, usize);
 
+struct OwnedBuffer {
+    bytes: Vec<u8>,
+    ownership: usize,
+}
+
 /// Result of byte batching: the output batches (each with its ownership weight)
 /// plus the count of oversize entries that were emitted whole instead of split.
 pub struct BytesBatches {
@@ -117,11 +122,11 @@ fn fully_parseable(buf: &[u8]) -> bool {
 /// Move the accumulated bytes in `cur` into a new output batch, if any. A
 /// packed/opaque batch carries no duplicated headers, so its ownership weight
 /// equals its own encoded length.
-fn flush(signal: SignalType, cur: &mut Vec<u8>, batches: &mut Vec<OwnedBatch>) {
-    if !cur.is_empty() {
-        let bytes = std::mem::take(cur);
-        let weight = bytes.len();
-        batches.push((OtlpProtoBytes::new_from_bytes(signal, bytes), weight));
+fn flush(signal: SignalType, cur: &mut OwnedBuffer, batches: &mut Vec<OwnedBatch>) {
+    if !cur.bytes.is_empty() {
+        let bytes = std::mem::take(&mut cur.bytes);
+        let ownership = std::mem::take(&mut cur.ownership);
+        batches.push((OtlpProtoBytes::new_from_bytes(signal, bytes), ownership));
     }
 }
 
@@ -134,6 +139,29 @@ fn emit_top(signal: SignalType, entry_bytes: &[u8], batches: &mut Vec<OwnedBatch
     write_len_delimited(&mut batch, RESOURCE_ENTRY_FIELD, entry_bytes);
     let weight = batch.len();
     batches.push((OtlpProtoBytes::new_from_bytes(signal, batch), weight));
+}
+
+fn pack_owned_batch(
+    signal: SignalType,
+    batch: OtlpProtoBytes,
+    ownership: usize,
+    max_size: usize,
+    cur: &mut OwnedBuffer,
+    batches: &mut Vec<OwnedBatch>,
+) {
+    let bytes = batch.as_bytes();
+    if cur.bytes.len() + bytes.len() <= max_size {
+        cur.bytes.extend_from_slice(bytes);
+        cur.ownership += ownership;
+        return;
+    }
+    flush(signal, cur, batches);
+    if bytes.len() > max_size {
+        batches.push((batch, ownership));
+    } else {
+        cur.bytes.extend_from_slice(bytes);
+        cur.ownership = ownership;
+    }
 }
 
 /// Redistribute `total` input-byte ownership evenly across the batches in
@@ -162,17 +190,20 @@ fn rescale_ownership(frags: &mut [OwnedBatch], total: usize) {
 fn push_opaque(
     signal: SignalType,
     full: &[u8],
+    ownership: usize,
     max_size: usize,
-    cur: &mut Vec<u8>,
+    cur: &mut OwnedBuffer,
     batches: &mut Vec<OwnedBatch>,
 ) {
-    if cur.len() + full.len() <= max_size {
-        cur.extend_from_slice(full);
+    if cur.bytes.len() + full.len() <= max_size {
+        cur.bytes.extend_from_slice(full);
+        cur.ownership += ownership;
         return;
     }
     flush(signal, cur, batches);
-    cur.extend_from_slice(full);
-    if cur.len() > max_size {
+    cur.bytes.extend_from_slice(full);
+    cur.ownership = ownership;
+    if cur.bytes.len() > max_size {
         // An indivisible unit larger than max_size is emitted on its own.
         flush(signal, cur, batches);
     }
@@ -186,40 +217,41 @@ fn push_resource_entry(
     signal: SignalType,
     full: &[u8],
     payload: &[u8],
+    ownership: usize,
     max_size: usize,
     fragment_budget: usize,
     overhead_budget: usize,
     flush_fragment_budget: usize,
-    cur: &mut Vec<u8>,
+    cur: &mut OwnedBuffer,
     batches: &mut Vec<OwnedBatch>,
     budget_fallbacks: &mut u64,
 ) {
-    if cur.len() + full.len() <= max_size {
-        cur.extend_from_slice(full);
+    if cur.bytes.len() + full.len() <= max_size {
+        cur.bytes.extend_from_slice(full);
+        cur.ownership += ownership;
         return;
     }
-    if full.len() <= max_size {
+    if cur.bytes.len() == max_size {
         flush(signal, cur, batches);
-        cur.extend_from_slice(full);
-        return;
     }
-    // A single resource entry exceeds max_size: split within it.
-    flush(signal, cur, batches);
-    let start = batches.len();
+    // Split the entry so its first fragment targets the currently available
+    // capacity, then return to max_size for every later fragment. This lets a
+    // retained partial consume records from the next resource without
+    // constraining the rest of that resource to undersized fragments.
+    let first_fragment_max_size = max_size - cur.bytes.len();
+    let mut fragments = Vec::new();
     if batches.len() >= flush_fragment_budget {
-        // Per-flush output ceiling already reached: emit this entry whole rather
-        // than fan it out into more in-memory fragments. Bounds the flush's
-        // total output allocation regardless of downstream slot accounting.
-        emit_top(signal, payload, batches);
+        emit_top(signal, payload, &mut fragments);
         *budget_fallbacks += 1;
     } else {
         split_resource_entry(
             signal,
             payload,
+            first_fragment_max_size,
             max_size,
             fragment_budget,
             overhead_budget,
-            batches,
+            &mut fragments,
             budget_fallbacks,
         );
     }
@@ -227,7 +259,68 @@ fn push_resource_entry(
     // headers, so their encoded lengths sum to more than the input entry.
     // Reattribute the entry's input bytes across the fragments (or the single
     // whole batch above) so Ack/Nack ownership sums back to the input.
-    rescale_ownership(&mut batches[start..], full.len());
+    rescale_ownership(&mut fragments, ownership);
+    for (fragment, fragment_ownership) in fragments {
+        pack_owned_batch(signal, fragment, fragment_ownership, max_size, cur, batches);
+    }
+}
+
+struct InputUnit<'a> {
+    full: &'a [u8],
+    resource_payload: Option<&'a [u8]>,
+}
+
+fn input_units(buf: &[u8]) -> Vec<InputUnit<'_>> {
+    let mut units = Vec::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        match next_field(buf, pos) {
+            Some((field, wire, payload_start, field_end)) => {
+                let resource_payload = (field == RESOURCE_ENTRY_FIELD && wire == wire_types::LEN)
+                    .then_some(&buf[payload_start..field_end]);
+                units.push(InputUnit {
+                    full: &buf[pos..field_end],
+                    resource_payload,
+                });
+                pos = field_end;
+            }
+            None => {
+                units.push(InputUnit {
+                    full: &buf[pos..],
+                    resource_payload: None,
+                });
+                break;
+            }
+        }
+    }
+    units
+}
+
+fn distribute_ownership(units: &[InputUnit<'_>], total: usize) -> Vec<usize> {
+    let total_bytes = units.iter().map(|unit| unit.full.len()).sum::<usize>();
+    if total == total_bytes {
+        return units.iter().map(|unit| unit.full.len()).collect();
+    }
+
+    let mut remaining_ownership = total;
+    let mut remaining_bytes = total_bytes;
+    let mut weights = Vec::with_capacity(units.len());
+    for (index, unit) in units.iter().enumerate() {
+        let remaining_units = units.len() - index;
+        let weight = if remaining_units == 1 {
+            remaining_ownership
+        } else {
+            let proportional = ((remaining_ownership as u128 * unit.full.len() as u128)
+                / remaining_bytes as u128) as usize;
+            proportional
+                .max(1)
+                .min(remaining_ownership - (remaining_units - 1))
+        };
+        weights.push(weight);
+        remaining_ownership -= weight;
+        remaining_bytes -= unit.full.len();
+    }
+    weights
 }
 
 /// Split one oversize resource entry into multiple valid resource entries,
@@ -251,6 +344,7 @@ fn push_resource_entry(
 fn split_resource_entry(
     signal: SignalType,
     entry_payload: &[u8],
+    first_fragment_max_size: usize,
     max_size: usize,
     fragment_budget: usize,
     overhead_budget: usize,
@@ -333,9 +427,21 @@ fn split_resource_entry(
     let mut emitted: usize = 0;
     let mut over_budget = false;
     let mut frag: Vec<u8> = header.clone();
+    let mut fragment_max_size = first_fragment_max_size;
     for (i, scope_full) in scope_fulls.iter().enumerate() {
         let prospective = frag.len() + scope_full.len();
-        if wrapped_len(RESOURCE_ENTRY_FIELD, prospective) <= max_size {
+        if wrapped_len(RESOURCE_ENTRY_FIELD, prospective) <= fragment_max_size {
+            frag.extend_from_slice(scope_full);
+            continue;
+        }
+        if frag.len() == header.len()
+            && fragment_max_size < max_size
+            && wrapped_len(RESOURCE_ENTRY_FIELD, prospective) <= max_size
+        {
+            // The scope cannot contribute to the preceding partial batch, but
+            // it fits whole in a fresh batch. Do not split it to the smaller
+            // residual limit, which would create undersized later fragments.
+            fragment_max_size = max_size;
             frag.extend_from_slice(scope_full);
             continue;
         }
@@ -344,13 +450,14 @@ fn split_resource_entry(
             emit_top(signal, &frag, batches);
             emitted = emitted.saturating_add(batches.last().map_or(0, |(_, w)| *w));
             frag.truncate(header.len());
+            fragment_max_size = max_size;
             if emitted > abort_at {
                 over_budget = true;
                 break;
             }
         }
         // Try the scope on its own.
-        if wrapped_len(RESOURCE_ENTRY_FIELD, header.len() + scope_full.len()) <= max_size {
+        if wrapped_len(RESOURCE_ENTRY_FIELD, header.len() + scope_full.len()) <= fragment_max_size {
             frag.extend_from_slice(scope_full);
         } else {
             // The scope alone is still too large: split it by records.
@@ -358,11 +465,13 @@ fn split_resource_entry(
                 signal,
                 &header,
                 scope_payloads[i],
+                fragment_max_size,
                 max_size,
                 abort_at,
                 &mut emitted,
                 batches,
             );
+            fragment_max_size = max_size;
             if emitted > abort_at {
                 over_budget = true;
                 break;
@@ -397,9 +506,11 @@ fn count_records(scope_payload: &[u8]) -> usize {
 }
 
 /// Split one oversize scope entry into multiple resource-entry fragments, each
-/// carrying `resource_header` + a scope wrapping a subset of the records. A
-/// single record that is larger than `max_size` (with minimal wrappers) is
-/// emitted on its own, exceeding the limit.
+/// carrying `resource_header` + a scope wrapping a subset of the records. The
+/// first fragment uses `first_fragment_max_size` to fill a preceding partial;
+/// later fragments use `max_size`. A single record that is larger than
+/// `max_size` (with minimal wrappers) is emitted on its own, exceeding the
+/// limit.
 ///
 /// The caller (`split_resource_entry`) only descends here after verifying the
 /// whole entry -- including this scope's payload -- is `fully_parseable`, so the
@@ -414,6 +525,7 @@ fn split_scope_entry(
     signal: SignalType,
     resource_header: &[u8],
     scope_payload: &[u8],
+    first_fragment_max_size: usize,
     max_size: usize,
     abort_at: usize,
     emitted: &mut usize,
@@ -455,17 +567,31 @@ fn split_scope_entry(
     }
 
     let mut recs: Vec<u8> = Vec::new();
+    let mut fragment_max_size = first_fragment_max_size;
     for rec in &record_fulls {
         let scope_inner_len = scope_header.len() + recs.len() + rec.len();
         let entry_len = resource_header.len() + wrapped_len(CHILD_LIST_FIELD, scope_inner_len);
-        if wrapped_len(RESOURCE_ENTRY_FIELD, entry_len) <= max_size {
+        if wrapped_len(RESOURCE_ENTRY_FIELD, entry_len) <= fragment_max_size {
             recs.extend_from_slice(rec);
             continue;
+        }
+        if recs.is_empty() && fragment_max_size < max_size {
+            let alone_inner = scope_header.len() + rec.len();
+            let alone_entry = resource_header.len() + wrapped_len(CHILD_LIST_FIELD, alone_inner);
+            if wrapped_len(RESOURCE_ENTRY_FIELD, alone_entry) <= max_size {
+                // This record cannot fill the preceding partial batch. Start a
+                // normal full-size fragment instead of emitting a tiny fragment
+                // constrained by the residual capacity.
+                fragment_max_size = max_size;
+                recs.extend_from_slice(rec);
+                continue;
+            }
         }
         if !recs.is_empty() {
             emit_frag(&recs, batches);
             *emitted = emitted.saturating_add(batches.last().map_or(0, |(_, w)| *w));
             recs.clear();
+            fragment_max_size = max_size;
             // Abort early so a large scope header re-encoded across many record
             // fragments cannot amplify transient memory past the budget; the
             // caller rolls the whole entry back to a single batch.
@@ -476,11 +602,12 @@ fn split_scope_entry(
         recs.extend_from_slice(rec);
         let alone_inner = scope_header.len() + rec.len();
         let alone_entry = resource_header.len() + wrapped_len(CHILD_LIST_FIELD, alone_inner);
-        if wrapped_len(RESOURCE_ENTRY_FIELD, alone_entry) > max_size {
+        if wrapped_len(RESOURCE_ENTRY_FIELD, alone_entry) > fragment_max_size {
             // Indivisible record larger than max_size: emit it on its own.
             emit_frag(&recs, batches);
             *emitted = emitted.saturating_add(batches.last().map_or(0, |(_, w)| *w));
             recs.clear();
+            fragment_max_size = max_size;
             if *emitted > abort_at {
                 return;
             }
@@ -565,34 +692,62 @@ pub fn make_bytes_batches_owned(
     flush_fragment_budget: Option<NonZeroU64>,
     inputs: Vec<OtlpProtoBytes>,
 ) -> Result<BytesBatches> {
+    let inputs = inputs
+        .into_iter()
+        .map(|input| {
+            let ownership = input.num_bytes();
+            (input, ownership)
+        })
+        .collect();
+    make_bytes_batches_from_owned(
+        signal,
+        max_bytes,
+        fragment_budget,
+        overhead_budget,
+        flush_fragment_budget,
+        inputs,
+    )
+}
+
+/// Like [`make_bytes_batches_owned`], but accepts inputs whose Ack/Nack
+/// ownership differs from encoded length because they were retained from a
+/// previous split.
+pub fn make_bytes_batches_from_owned(
+    signal: SignalType,
+    max_bytes: Option<NonZeroU64>,
+    fragment_budget: Option<NonZeroU64>,
+    overhead_budget: Option<NonZeroU64>,
+    flush_fragment_budget: Option<NonZeroU64>,
+    inputs: Vec<(OtlpProtoBytes, usize)>,
+) -> Result<BytesBatches> {
     if inputs.is_empty() {
         return Err(Error::EmptyBatch);
     }
-    let total_size: usize = inputs.iter().map(|i| i.num_bytes()).sum();
+    let total_size: usize = inputs.iter().map(|(input, _)| input.num_bytes()).sum();
     if total_size == 0 {
         return Err(Error::EmptyBatch);
     }
+    let total_ownership = inputs.iter().map(|(_, ownership)| *ownership).sum();
 
-    // Emit a single input (or the whole concatenation) as one batch whose
-    // ownership weight equals its encoded length (no headers are duplicated).
-    let single = |inputs: Vec<OtlpProtoBytes>| -> BytesBatches {
+    let single = |inputs: Vec<(OtlpProtoBytes, usize)>| -> BytesBatches {
         if inputs.len() == 1 {
-            let batch = inputs.into_iter().next().expect("one input");
-            let weight = batch.num_bytes();
+            let (batch, ownership) = inputs.into_iter().next().expect("one input");
             return BytesBatches {
-                batches: vec![(batch, weight)],
+                batches: vec![(batch, ownership)],
                 budget_fallbacks: 0,
             };
         }
         let bytes = inputs
             .iter()
-            .fold(Vec::with_capacity(total_size), |mut acc, record| {
+            .fold(Vec::with_capacity(total_size), |mut acc, (record, _)| {
                 acc.extend_from_slice(record.as_bytes());
                 acc
             });
-        let weight = bytes.len();
         BytesBatches {
-            batches: vec![(OtlpProtoBytes::new_from_bytes(signal, bytes), weight)],
+            batches: vec![(
+                OtlpProtoBytes::new_from_bytes(signal, bytes),
+                total_ownership,
+            )],
             budget_fallbacks: 0,
         }
     };
@@ -621,40 +776,45 @@ pub fn make_bytes_batches_owned(
     let mut batches: Vec<OwnedBatch> = Vec::new();
     // Reserve for the common top-level packing path; a batch never exceeds
     // `max_size` unless a single indivisible unit forces it.
-    let mut cur: Vec<u8> = Vec::with_capacity(total_size.min(max_size));
+    let mut cur = OwnedBuffer {
+        bytes: Vec::with_capacity(total_size.min(max_size)),
+        ownership: 0,
+    };
     let mut budget_fallbacks: u64 = 0;
 
-    for input in &inputs {
+    for (input, ownership) in &inputs {
         let buf = input.as_bytes();
-        let mut pos = 0;
-        while pos < buf.len() {
-            match next_field(buf, pos) {
-                Some((field, wire, payload_start, field_end)) => {
-                    let full = &buf[pos..field_end];
-                    pos = field_end;
-                    if field == RESOURCE_ENTRY_FIELD && wire == wire_types::LEN {
-                        push_resource_entry(
-                            signal,
-                            full,
-                            &buf[payload_start..field_end],
-                            max_size,
-                            fragment_budget,
-                            overhead_budget,
-                            flush_fragment_budget,
-                            &mut cur,
-                            &mut batches,
-                            &mut budget_fallbacks,
-                        );
-                    } else {
-                        push_opaque(signal, full, max_size, &mut cur, &mut batches);
-                    }
-                }
-                None => {
-                    // Malformed field: treat the rest of the buffer as opaque.
-                    let full = &buf[pos..];
-                    pos = buf.len();
-                    push_opaque(signal, full, max_size, &mut cur, &mut batches);
-                }
+        let units = input_units(buf);
+        if *ownership < units.len() {
+            return Err(Error::Format {
+                error: "OTLP input ownership is smaller than its top-level field count".into(),
+            });
+        }
+        let weights = distribute_ownership(&units, *ownership);
+        for (unit, unit_ownership) in units.into_iter().zip(weights) {
+            if let Some(payload) = unit.resource_payload {
+                push_resource_entry(
+                    signal,
+                    unit.full,
+                    payload,
+                    unit_ownership,
+                    max_size,
+                    fragment_budget,
+                    overhead_budget,
+                    flush_fragment_budget,
+                    &mut cur,
+                    &mut batches,
+                    &mut budget_fallbacks,
+                );
+            } else {
+                push_opaque(
+                    signal,
+                    unit.full,
+                    unit_ownership,
+                    max_size,
+                    &mut cur,
+                    &mut batches,
+                );
             }
         }
     }

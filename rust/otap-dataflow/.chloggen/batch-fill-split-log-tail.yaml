@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: "Avoid exporting undersized intermediate OTLP batches during sustained traffic."
+issues: [3673]
+subtext: "Split log batches now fill residual capacity from following resources, while only the final partial batch waits for the configured timeout."
